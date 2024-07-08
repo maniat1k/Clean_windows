@@ -1,0 +1,26 @@
+@echo off
+title Optimización del equipo
+
+:: Limpia archivos temporales
+echo Limpiando archivos temporales...
+del /q /f /s %TEMP%\*
+del /q /f /s C:\Windows\Temp\*
+
+:: Desfragmenta el disco (solo para HDD, no para SSD)
+echo Desfragmentando el disco...
+defrag C: /U /V
+
+:: Libera memoria
+echo Liberando memoria...
+for /f "tokens=2" %%a in ('tasklist ^| find /i "chrome.exe"') do taskkill /f /pid %%a
+for /f "tokens=2" %%a in ('tasklist ^| find /i "firefox.exe"') do taskkill /f /pid %%a
+for /f "tokens=2" %%a in ('tasklist ^| find /i "edge.exe"') do taskkill /f /pid %%a
+
+:: Deshabilita servicios innecesarios
+echo Deshabilitando servicios innecesarios...
+sc config "DiagTrack" start= disabled
+sc config "dmwappushservice" start= disabled
+
+:: Finalización
+echo Optimización completada.
+pause
