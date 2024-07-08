@@ -1,14 +1,32 @@
 @echo off
 title Optimización del equipo
 
+:: Función para determinar el tipo de disco
+:CheckDiskType
+for /f "skip=2 tokens=2 delims=," %%i in ('wmic diskdrive get model^,mediaType /format:csv') do (
+    if "%%i"=="SSD" (
+        set SSD=1
+    ) else (
+        set HDD=1
+    )
+)
+goto :eof
+
 :: Limpia archivos temporales
 echo Limpiando archivos temporales...
 del /q /f /s %TEMP%\*
 del /q /f /s C:\Windows\Temp\*
 
-:: Desfragmenta el disco (solo para HDD, no para SSD)
-echo Desfragmentando el disco...
-defrag C: /U /V
+:: Determina el tipo de disco
+call :CheckDiskType
+
+:: Desfragmenta el disco si es HDD
+if defined HDD (
+    echo Desfragmentando el disco duro...
+    defrag C: /U /V
+) else (
+    echo El disco es SSD. No se necesita desfragmentar.
+)
 
 :: Libera memoria
 echo Liberando memoria...
