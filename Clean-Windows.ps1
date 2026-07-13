@@ -1,46 +1,178 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    Ejecuta mantenimiento seguro y auditable para Windows 11.
 
-[CmdletBinding()]
-param()
+.DESCRIPTION
+    Clean-Windows.ps1 es una herramienta modular para limpiar cachés de usuario,
+    temporales de Windows, targets modernos de Windows 11, caché de Delivery
+    Optimization, componentes de Windows mediante DISM, papelera de reciclaje,
+    auditoría de discos y reparación conservadora del PATH.
+
+    El script usa funciones Verb-Noun, admite -WhatIf, -Verbose y -Force, evita
+    seguir puntos de reanálisis, omite archivos bloqueados y exige elevación
+    explícita para operaciones de sistema.
+
+.PARAMETER Task
+    Tareas a ejecutar. Si no se indica ninguna tarea, se muestra la TUI.
+    Valores:
+    All, TemporaryFiles, Win11Caches, DeliveryOptimization, WindowsComponents,
+    RecycleBin, DiskInfo, DefragHdd, Path, Memory, Services, Python.
+
+.PARAMETER Menu
+    Muestra el menú interactivo aunque se hayan indicado tareas.
+
+.PARAMETER OlderThanDays
+    Antigüedad mínima de archivos a eliminar en limpiezas manuales. Por defecto 1.
+    Use 0 para procesar todo el contenido elegible.
+
+.PARAMETER DriveLetter
+    Letra de unidad para DefragHdd. Por defecto C.
+
+.PARAMETER Force
+    Omite confirmaciones interactivas propias del script. No desactiva -WhatIf.
+
+.EXAMPLE
+    .\Clean-Windows.ps1 -Task All -Verbose
+
+.EXAMPLE
+    .\Clean-Windows.ps1 -Task Win11Caches,DeliveryOptimization -OlderThanDays 0 -WhatIf
+
+.EXAMPLE
+    .\Clean-Windows.ps1 -Menu
+
+.NOTES
+    Requiere Windows PowerShell 5.1 o PowerShell 7.
+    Las tareas de sistema requieren ejecutar PowerShell como Administrador.
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+    [ValidateSet(
+        'All',
+        'TemporaryFiles',
+        'Win11Caches',
+        'DeliveryOptimization',
+        'WindowsComponents',
+        'RecycleBin',
+        'DiskInfo',
+        'DefragHdd',
+        'Path',
+        'Memory',
+        'Services',
+        'Python'
+    )]
+    [string[]]$Task,
+
+    [switch]$Menu,
+
+    [ValidateRange(0, 3650)]
+    [int]$OlderThanDays = 1,
+
+    [ValidatePattern('^[A-Za-z]$')]
+    [string]$DriveLetter = 'C',
+
+    [switch]$Force,
+
+    [switch]$NoElevate
+)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
 $script:ToolRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:IsAdmin = $false
 
 function Test-Administrator {
+    <#
+    .SYNOPSIS
+        Indica si la sesión actual está elevada como Administrador.
+    #>
+    [CmdletBinding()]
+    param()
+
     try {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
         return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { return $false }
+    } catch {
+        Write-Verbose "No se pudo verificar la elevación: $($_.Exception.Message)"
+        return $false
+    }
 }
 
-function Write-Title([string]$Text) {
-    Write-Host "`n== $Text ==" -ForegroundColor Cyan
-}
+function Assert-Administrator {
+    <#
+    .SYNOPSIS
+        Valida elevación antes de una operación que modifica el sistema.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Operation
+    )
 
-function Write-Info([string]$Text) { Write-Host "[INFO] $Text" -ForegroundColor Cyan }
-function Write-Ok([string]$Text) { Write-Host "[OK]   $Text" -ForegroundColor Green }
-function Write-Warn([string]$Text) { Write-Host "[AVISO] $Text" -ForegroundColor Yellow }
-function Write-Fail([string]$Text) { Write-Host "[ERROR] $Text" -ForegroundColor Red }
+    if (Test-Administrator) {
+        return $true
+    }
 
-function Confirm-Action([string]$Message) {
-    $answer = Read-Host "$Message (S/N)"
-    return $answer -match '^(s|si|sí|y|yes)$'
-}
-
-function Test-AdminRequired([string]$Action) {
-    if ($script:IsAdmin) { return $true }
-    Write-Warn "'$Action' requiere ejecutar PowerShell como Administrador."
+    Write-Warning "'$Operation' requiere ejecutar PowerShell como Administrador. Tarea omitida."
     return $false
 }
 
-function Pause-Toolkit {
-    [void](Read-Host "`nPresioná Enter para volver al menú")
+function Request-AdministratorRelaunch {
+    <#
+    .SYNOPSIS
+        Relanza el script con elevación UAC cuando la sesión no es Administrador.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($NoElevate -or (Test-Administrator)) {
+        return
+    }
+
+    Clear-Host
+    Write-Host ''
+    Write-Host '  CLEAN WINDOWS requiere permisos de Administrador.' -ForegroundColor Yellow
+    Write-Host '  Se solicitará elevación mediante UAC para continuar de forma segura.' -ForegroundColor Gray
+    Write-Host ''
+
+    $hostExe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) {
+        $scriptPath = $MyInvocation.MyCommand.Path
+    }
+
+    $argumentList = @(
+        '-NoProfile'
+        '-ExecutionPolicy'
+        'Bypass'
+        '-File'
+        ('"{0}"' -f $scriptPath)
+    )
+
+    try {
+        Start-Process -FilePath $hostExe -ArgumentList ($argumentList -join ' ') -Verb RunAs -ErrorAction Stop
+    } catch {
+        Write-Host "  No se pudo solicitar elevación: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host '  Abre PowerShell como Administrador y vuelve a ejecutar el script.' -ForegroundColor Yellow
+        [void](Read-Host '  Presiona Enter para salir')
+    }
+
+    exit
 }
 
-function Format-Bytes([double]$Bytes) {
+function Format-ByteSize {
+    <#
+    .SYNOPSIS
+        Formatea bytes en una unidad legible.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [double]$Bytes
+    )
+
     if ($Bytes -ge 1TB) { return ('{0:N2} TB' -f ($Bytes / 1TB)) }
     if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
     if ($Bytes -ge 1MB) { return ('{0:N2} MB' -f ($Bytes / 1MB)) }
@@ -48,458 +180,1163 @@ function Format-Bytes([double]$Bytes) {
     return ('{0:N0} bytes' -f $Bytes)
 }
 
-function Get-DirectorySize([string]$Path) {
-    try {
-        $sum = (Get-ChildItem -LiteralPath $Path -Force -Recurse -File -ErrorAction SilentlyContinue |
-            Measure-Object -Property Length -Sum).Sum
-        if ($null -eq $sum) { return 0 }
-        return [double]$sum
-    } catch { return 0 }
-}
-
-function Invoke-TemporaryCleanup {
-    Write-Title 'Limpieza de archivos temporales'
-    $targets = @($env:TEMP)
-    if ($script:IsAdmin) { $targets += (Join-Path $env:WINDIR 'Temp') }
-    else { Write-Warn 'Windows\Temp se omitirá porque requiere privilegios de Administrador.' }
-
-    $targets = @($targets | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)
-    if ($targets.Count -eq 0) { Write-Warn 'No se encontraron carpetas temporales accesibles.'; return }
-    $targets | ForEach-Object { Write-Host "  - $_" -ForegroundColor DarkGray }
-    Write-Warn 'Los archivos en uso se conservarán.'
-    if (-not (Confirm-Action '¿Eliminar el contenido de estas carpetas temporales?')) {
-        Write-Info 'Acción cancelada.'; return
-    }
-
-    $before = 0; $removed = 0; $failed = 0
-    foreach ($target in $targets) {
-        $before += Get-DirectorySize $target
-        Get-ChildItem -LiteralPath $target -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop; $removed++ }
-            catch { $failed++ }
-        }
-    }
-    Write-Ok "Resumen: $removed elementos eliminados; $failed omitidos/en uso; hasta $(Format-Bytes $before) procesados."
-}
-
-function Invoke-BrowserCleanup {
-    Write-Title 'Liberar memoria cerrando navegadores'
-    $names = @('chrome','msedge','firefox','brave','opera')
-    $processes = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
-    if ($processes.Count -eq 0) { Write-Info 'No hay navegadores compatibles en ejecución.'; return }
-    $processes | Group-Object ProcessName | ForEach-Object {
-        Write-Host ("  {0}: {1} proceso(s)" -f $_.Name, $_.Count) -ForegroundColor Yellow
-    }
-    Write-Warn 'Cerrarlos puede descartar formularios o sesiones no guardadas.'
-    if (-not (Confirm-Action '¿Cerrar estos navegadores?')) { Write-Info 'Acción cancelada.'; return }
-    $closed = 0; $failed = 0
-    foreach ($process in $processes) {
-        try { Stop-Process -Id $process.Id -Force -ErrorAction Stop; $closed++ } catch { $failed++ }
-    }
-    Write-Ok "Resumen: $closed procesos cerrados; $failed no pudieron cerrarse."
-}
-
-function Get-DiskInventory {
-    $items = @()
-    try {
-        foreach ($disk in @(Get-PhysicalDisk -ErrorAction Stop)) {
-            $media = [string]$disk.MediaType
-            if ($media -notin @('SSD','HDD')) { $media = 'Desconocido' }
-            $items += [pscustomobject]@{
-                Number = [string]$disk.DeviceId; Model = [string]$disk.FriendlyName
-                MediaType = $media; Size = [double]$disk.Size
-            }
-        }
-    } catch {
-        foreach ($disk in @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop)) {
-            $label = "{0} {1}" -f $disk.Model, $disk.MediaType
-            $media = if ($label -match 'SSD|NVMe|Solid State') { 'SSD' } elseif ($label -match 'HDD|Hard Disk') { 'HDD' } else { 'Desconocido' }
-            $items += [pscustomobject]@{
-                Number = [string]$disk.Index; Model = [string]$disk.Model
-                MediaType = $media; Size = [double]$disk.Size
-            }
-        }
-    }
-    return $items
-}
-
-function Show-DiskType {
-    Write-Title 'Detección de discos'
-    try {
-        $disks = @(Get-DiskInventory)
-        if ($disks.Count -eq 0) { Write-Warn 'No se detectaron discos físicos.'; return }
-        $disks | Select-Object @{N='Disco';E={$_.Number}}, @{N='Modelo';E={$_.Model}},
-            @{N='Tipo';E={$_.MediaType}}, @{N='Tamaño';E={Format-Bytes $_.Size}} | Format-Table -AutoSize
-        if ($disks.MediaType -contains 'Desconocido') {
-            Write-Warn 'No se asumirá que un disco desconocido es HDD.'
-        }
-        Write-Ok "Resumen: $($disks.Count) disco(s) detectado(s)."
-    } catch { Write-Fail "No fue posible consultar los discos: $($_.Exception.Message)" }
-}
-
-function Get-DriveMediaType([char]$DriveLetter) {
-    $partition = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
-    $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction Stop
-    $physical = @(Get-DiskInventory | Where-Object { $_.Number -eq [string]$disk.Number }) | Select-Object -First 1
-    if ($null -eq $physical) { return 'Desconocido' }
-    return $physical.MediaType
-}
-
-function Invoke-HddDefrag {
-    Write-Title 'Desfragmentar una unidad HDD'
-    if (-not (Test-AdminRequired 'Desfragmentar disco')) { return }
-    $inputDrive = (Read-Host 'Letra de unidad [C]').Trim().TrimEnd(':')
-    if (-not $inputDrive) { $inputDrive = 'C' }
-    if ($inputDrive -notmatch '^[A-Za-z]$') { Write-Warn 'Letra de unidad inválida.'; return }
-    $letter = [char]$inputDrive.ToUpperInvariant()
-    try {
-        $volume = Get-Volume -DriveLetter $letter -ErrorAction Stop
-        $media = Get-DriveMediaType $letter
-        Write-Info "Unidad $letter`: ($($volume.FileSystemLabel)) detectada como: $media."
-        if ($media -eq 'SSD') { Write-Warn 'Acción bloqueada: esta herramienta no desfragmenta SSD.'; return }
-        if ($media -ne 'HDD') { Write-Warn 'Acción bloqueada: no se pudo confirmar que la unidad esté en un HDD.'; return }
-        if (-not (Confirm-Action "¿Ejecutar la desfragmentación de $letter`:? Puede tardar bastante")) {
-            Write-Info 'Acción cancelada.'; return
-        }
-        & "$env:WINDIR\System32\defrag.exe" "$letter`:" /U /V
-        if ($LASTEXITCODE -eq 0) { Write-Ok "Resumen: desfragmentación de $letter`: completada." }
-        else { Write-Fail "Defrag terminó con código $LASTEXITCODE." }
-    } catch { Write-Fail "No se pudo desfragmentar: $($_.Exception.Message)" }
-}
-
-function Invoke-ServiceReview {
-    Write-Title 'Servicios opcionales conocidos'
-    if (-not (Test-AdminRequired 'Modificar servicios')) { return }
-    $serviceDefinitions = @(
-        @{ Name='DiagTrack'; Description='telemetría y experiencias de usuario conectado' },
-        @{ Name='dmwappushservice'; Description='enrutamiento de mensajes WAP (puede no existir)' }
+function Write-Operation {
+    <#
+    .SYNOPSIS
+        Escribe salida limpia usando el stream de información.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
     )
-    $changed = 0; $skipped = 0
+
+    Write-Information $Message -InformationAction Continue
+}
+
+function Confirm-CleanAction {
+    <#
+    .SYNOPSIS
+        Solicita confirmación salvo que -Force esté activo.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    if ($Force) {
+        return $true
+    }
+
+    $answer = Read-Host "$Message (S/N)"
+    return $answer -match '^(s|si|sí|y|yes)$'
+}
+
+function Test-ReparsePoint {
+    <#
+    .SYNOPSIS
+        Detecta enlaces simbólicos, junctions y otros puntos de reanálisis.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [System.IO.FileSystemInfo]$Item
+    )
+
+    process {
+        return (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    }
+}
+
+function Get-DirectorySize {
+    <#
+    .SYNOPSIS
+        Calcula tamaño de archivos accesibles sin detenerse por elementos bloqueados.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return 0
+    }
+
+    $total = 0.0
+    try {
+        Get-ChildItem -LiteralPath $Path -Force -Recurse -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $total += [double]$_.Length }
+    } catch {
+        Write-Verbose "Tamaño parcial para '$Path': $($_.Exception.Message)"
+    }
+
+    return $total
+}
+
+function Remove-CleanItem {
+    <#
+    .SYNOPSIS
+        Elimina un archivo o carpeta de forma conservadora.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [System.IO.FileSystemInfo]$Item,
+
+        [Parameter(Mandatory)]
+        [datetime]$OlderThan
+    )
+
+    process {
+        if (Test-ReparsePoint -Item $Item) {
+            Write-Verbose "Omitido punto de reanálisis: $($Item.FullName)"
+            return [pscustomobject]@{ Removed = 0; Skipped = 1; Failed = 0; Bytes = 0.0 }
+        }
+
+        if ($Item.LastWriteTime -gt $OlderThan) {
+            Write-Verbose "Omitido por antigüedad: $($Item.FullName)"
+            return [pscustomobject]@{ Removed = 0; Skipped = 1; Failed = 0; Bytes = 0.0 }
+        }
+
+        $bytes = 0.0
+        if (-not $Item.PSIsContainer) {
+            $bytes = [double]$Item.Length
+        } else {
+            $bytes = Get-DirectorySize -Path $Item.FullName
+        }
+
+        if (-not $PSCmdlet.ShouldProcess($Item.FullName, 'Eliminar elemento de caché/temporal')) {
+            return [pscustomobject]@{ Removed = 0; Skipped = 1; Failed = 0; Bytes = $bytes }
+        }
+
+        try {
+            Remove-Item -LiteralPath $Item.FullName -Recurse -Force -ErrorAction Stop
+            return [pscustomobject]@{ Removed = 1; Skipped = 0; Failed = 0; Bytes = $bytes }
+        } catch [System.UnauthorizedAccessException] {
+            Write-Verbose "Bloqueado o sin permisos: $($Item.FullName)"
+            return [pscustomobject]@{ Removed = 0; Skipped = 1; Failed = 0; Bytes = 0.0 }
+        } catch [System.IO.IOException] {
+            Write-Verbose "En uso por el sistema o una aplicación: $($Item.FullName)"
+            return [pscustomobject]@{ Removed = 0; Skipped = 1; Failed = 0; Bytes = 0.0 }
+        } catch {
+            Write-Warning "No se pudo eliminar '$($Item.FullName)': $($_.Exception.Message)"
+            return [pscustomobject]@{ Removed = 0; Skipped = 0; Failed = 1; Bytes = 0.0 }
+        }
+    }
+}
+
+function New-CleanTarget {
+    <#
+    .SYNOPSIS
+        Crea una definición de target de limpieza.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$RequiresAdministrator
+    )
+
+    [pscustomobject]@{
+        Name = $Name
+        Path = [Environment]::ExpandEnvironmentVariables($Path)
+        RequiresAdministrator = [bool]$RequiresAdministrator
+    }
+}
+
+function Get-TemporaryCleanTarget {
+    <#
+    .SYNOPSIS
+        Devuelve targets temporales actuales para Windows 11.
+    #>
+    [CmdletBinding()]
+    param()
+
+    @(
+        New-CleanTarget -Name 'TEMP del usuario' -Path $env:TEMP
+        New-CleanTarget -Name 'Windows Temp' -Path (Join-Path $env:WINDIR 'Temp') -RequiresAdministrator
+    )
+}
+
+function Get-Windows11CleanTarget {
+    <#
+    .SYNOPSIS
+        Devuelve cachés modernas de Windows 11 y aplicaciones integradas.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $local = $env:LOCALAPPDATA
+    $programData = $env:ProgramData
+
+    @(
+        New-CleanTarget -Name 'Nuevo Teams - LocalCache' -Path (Join-Path $local 'Packages\MSTeams_8wekyb3d8bbwe\LocalCache')
+        New-CleanTarget -Name 'Nuevo Teams - TempState' -Path (Join-Path $local 'Packages\MSTeams_8wekyb3d8bbwe\TempState')
+        New-CleanTarget -Name 'Teams clásico/UWP - LocalCache' -Path (Join-Path $local 'Packages\MicrosoftTeams_8wekyb3d8bbwe\LocalCache')
+        New-CleanTarget -Name 'Edge WebView2 - Cache' -Path (Join-Path $local 'Microsoft\EdgeWebView\User Data\Default\Cache')
+        New-CleanTarget -Name 'Edge WebView2 - Code Cache' -Path (Join-Path $local 'Microsoft\EdgeWebView\User Data\Default\Code Cache')
+        New-CleanTarget -Name 'Edge WebView2 - GPUCache' -Path (Join-Path $local 'Microsoft\EdgeWebView\User Data\Default\GPUCache')
+        New-CleanTarget -Name 'Edge WebView2 - Service Worker Cache' -Path (Join-Path $local 'Microsoft\EdgeWebView\User Data\Default\Service Worker\CacheStorage')
+        New-CleanTarget -Name 'Widgets/Web Experience - LocalCache' -Path (Join-Path $local 'Packages\MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy\LocalCache')
+        New-CleanTarget -Name 'Widgets/Web Experience - TempState' -Path (Join-Path $local 'Packages\MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy\TempState')
+        New-CleanTarget -Name 'Widgets/Web Experience - AC Temp' -Path (Join-Path $local 'Packages\MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy\AC\Temp')
+        New-CleanTarget -Name 'Windows Error Reporting del usuario' -Path (Join-Path $local 'Microsoft\Windows\WER\ReportArchive')
+        New-CleanTarget -Name 'Windows Error Reporting del sistema' -Path (Join-Path $programData 'Microsoft\Windows\WER\ReportArchive') -RequiresAdministrator
+    )
+}
+
+function Invoke-TargetCleanup {
+    <#
+    .SYNOPSIS
+        Limpia un conjunto de targets verificando permisos, edad y puntos de reanálisis.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Target,
+
+        [ValidateRange(0, 3650)]
+        [int]$OlderThanDays = 1
+    )
+
+    $olderThan = (Get-Date).AddDays(-$OlderThanDays)
+    $totalRemoved = 0
+    $totalSkipped = 0
+    $totalFailed = 0
+    $totalBytes = 0.0
+
+    foreach ($targetItem in $Target) {
+        if ($targetItem.RequiresAdministrator -and -not (Assert-Administrator -Operation $targetItem.Name)) {
+            $totalSkipped++
+            continue
+        }
+
+        if (-not (Test-Path -LiteralPath $targetItem.Path)) {
+            Write-Verbose "No existe: $($targetItem.Path)"
+            continue
+        }
+
+        Write-Operation "Procesando: $($targetItem.Name)"
+        Write-Verbose "Path: $($targetItem.Path)"
+
+        try {
+            $children = @(Get-ChildItem -LiteralPath $targetItem.Path -Force -ErrorAction Stop)
+        } catch {
+            Write-Warning "No se pudo enumerar '$($targetItem.Path)': $($_.Exception.Message)"
+            $totalFailed++
+            continue
+        }
+
+        foreach ($child in $children) {
+            $result = Remove-CleanItem -Item $child -OlderThan $olderThan -WhatIf:$WhatIfPreference
+            $totalRemoved += $result.Removed
+            $totalSkipped += $result.Skipped
+            $totalFailed += $result.Failed
+            $totalBytes += $result.Bytes
+        }
+    }
+
+    [pscustomobject]@{
+        Removed = $totalRemoved
+        Skipped = $totalSkipped
+        Failed = $totalFailed
+        EstimatedBytes = $totalBytes
+    }
+}
+
+function Invoke-TemporaryFileCleanup {
+    <#
+    .SYNOPSIS
+        Limpia temporales de usuario y Windows Temp.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [ValidateRange(0, 3650)]
+        [int]$OlderThanDays = 1
+    )
+
+    Write-Operation '== Limpieza de archivos temporales =='
+    $targets = @(Get-TemporaryCleanTarget)
+    $summary = Invoke-TargetCleanup -Target $targets -OlderThanDays $OlderThanDays -WhatIf:$WhatIfPreference
+    Write-Operation ("Resumen temporales: {0} eliminados, {1} omitidos, {2} fallidos, {3} estimados." -f $summary.Removed, $summary.Skipped, $summary.Failed, (Format-ByteSize $summary.EstimatedBytes))
+}
+
+function Invoke-Windows11CacheCleanup {
+    <#
+    .SYNOPSIS
+        Limpia cachés modernas de Windows 11 como Nuevo Teams, WebView2 y Widgets.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [ValidateRange(0, 3650)]
+        [int]$OlderThanDays = 1
+    )
+
+    Write-Operation '== Limpieza de cachés Windows 11 =='
+    $targets = @(Get-Windows11CleanTarget)
+    $summary = Invoke-TargetCleanup -Target $targets -OlderThanDays $OlderThanDays -WhatIf:$WhatIfPreference
+    Write-Operation ("Resumen Win11: {0} eliminados, {1} omitidos, {2} fallidos, {3} estimados." -f $summary.Removed, $summary.Skipped, $summary.Failed, (Format-ByteSize $summary.EstimatedBytes))
+}
+
+function Invoke-DeliveryOptimizationCleanup {
+    <#
+    .SYNOPSIS
+        Limpia caché de Delivery Optimization con cmdlet nativo cuando está disponible.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    Write-Operation '== Limpieza de Delivery Optimization =='
+    if (-not (Assert-Administrator -Operation 'Limpiar Delivery Optimization')) {
+        return
+    }
+
+    $command = Get-Command -Name Clear-DeliveryOptimizationCache -ErrorAction SilentlyContinue
+    if ($command) {
+        if ($PSCmdlet.ShouldProcess('Delivery Optimization cache', 'Clear-DeliveryOptimizationCache -Force')) {
+            try {
+                Clear-DeliveryOptimizationCache -Force -ErrorAction Stop
+                Write-Operation 'Delivery Optimization: caché limpiada con cmdlet nativo.'
+            } catch {
+                Write-Warning "Clear-DeliveryOptimizationCache falló: $($_.Exception.Message)"
+            }
+        }
+        return
+    }
+
+    $fallback = Join-Path $env:WINDIR 'SoftwareDistribution\DeliveryOptimization\Cache'
+    if (-not (Test-Path -LiteralPath $fallback)) {
+        Write-Verbose 'No se encontró cmdlet ni carpeta fallback de Delivery Optimization.'
+        return
+    }
+
+    Write-Warning 'Clear-DeliveryOptimizationCache no está disponible; se usará fallback conservador sobre la caché.'
+    $target = New-CleanTarget -Name 'Delivery Optimization fallback' -Path $fallback -RequiresAdministrator
+    [void](Invoke-TargetCleanup -Target @($target) -OlderThanDays 1 -WhatIf:$WhatIfPreference)
+}
+
+function Invoke-WindowsComponentCleanup {
+    <#
+    .SYNOPSIS
+        Ejecuta DISM StartComponentCleanup para WinSxS/component store.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    Write-Operation '== Limpieza de componentes de Windows =='
+    if (-not (Assert-Administrator -Operation 'DISM StartComponentCleanup')) {
+        return
+    }
+
+    $dism = Join-Path $env:WINDIR 'System32\dism.exe'
+    if (-not (Test-Path -LiteralPath $dism)) {
+        throw "No se encontró DISM en '$dism'."
+    }
+
+    if ($PSCmdlet.ShouldProcess('Component Store', 'DISM /Online /Cleanup-Image /StartComponentCleanup')) {
+        & $dism /Online /Cleanup-Image /StartComponentCleanup
+        if ($LASTEXITCODE -ne 0) {
+            throw "DISM terminó con código $LASTEXITCODE."
+        }
+        Write-Operation 'DISM completó StartComponentCleanup correctamente.'
+    }
+}
+
+function Invoke-RecycleBinCleanup {
+    <#
+    .SYNOPSIS
+        Vacía la papelera usando Clear-RecycleBin.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    Write-Operation '== Limpieza de papelera =='
+    $command = Get-Command -Name Clear-RecycleBin -ErrorAction SilentlyContinue
+    if (-not $command) {
+        Write-Warning 'Clear-RecycleBin no está disponible en esta sesión.'
+        return
+    }
+
+    if ($PSCmdlet.ShouldProcess('Recycle Bin', 'Clear-RecycleBin')) {
+        try {
+            Clear-RecycleBin -Force:$Force -ErrorAction Stop
+            Write-Operation 'Papelera limpiada.'
+        } catch {
+            Write-Warning "No se pudo limpiar la papelera: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Invoke-BrowserMemoryCleanup {
+    <#
+    .SYNOPSIS
+        Libera memoria cerrando navegadores conocidos previa confirmación.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    Write-Host ''
+    Write-Host '== Liberar memoria ==' -ForegroundColor Cyan
+    $names = @('chrome', 'msedge', 'firefox', 'brave', 'opera')
+    $processes = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
+
+    if ($processes.Count -eq 0) {
+        Write-Host 'No hay navegadores compatibles en ejecución.' -ForegroundColor Gray
+        return
+    }
+
+    $processes | Group-Object ProcessName | ForEach-Object {
+        Write-Host ('  {0}: {1} proceso(s)' -f $_.Name, $_.Count) -ForegroundColor Yellow
+    }
+
+    Write-Host 'Cerrar navegadores puede descartar formularios o sesiones no guardadas.' -ForegroundColor Yellow
+    if (-not (Confirm-CleanAction -Message 'Cerrar estos navegadores')) {
+        Write-Host 'Acción cancelada.' -ForegroundColor Gray
+        return
+    }
+
+    $closed = 0
+    $failed = 0
+    foreach ($process in $processes) {
+        if ($PSCmdlet.ShouldProcess($process.ProcessName, 'Cerrar proceso')) {
+            try {
+                Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                $closed++
+            } catch {
+                Write-Warning "No se pudo cerrar $($process.ProcessName) [$($process.Id)]: $($_.Exception.Message)"
+                $failed++
+            }
+        }
+    }
+
+    Write-Host ("Resumen: {0} proceso(s) cerrados; {1} fallidos." -f $closed, $failed) -ForegroundColor Green
+}
+
+function Disable-OptionalService {
+    <#
+    .SYNOPSIS
+        Detiene y deshabilita servicios opcionales conocidos previa confirmación.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    Write-Host ''
+    Write-Host '== Desactivar servicios opcionales ==' -ForegroundColor Cyan
+    if (-not (Assert-Administrator -Operation 'Desactivar servicios')) {
+        return
+    }
+
+    $serviceDefinitions = @(
+        @{ Name = 'DiagTrack'; Description = 'Telemetría y experiencias de usuario conectado' },
+        @{ Name = 'dmwappushservice'; Description = 'Enrutamiento de mensajes WAP; puede no existir' }
+    )
+
+    $changed = 0
+    $skipped = 0
+
     foreach ($definition in $serviceDefinitions) {
         $service = Get-Service -Name $definition.Name -ErrorAction SilentlyContinue
-        if ($null -eq $service) { Write-Info "$($definition.Name): no está instalado."; continue }
-        $startMode = (Get-CimInstance Win32_Service -Filter "Name='$($definition.Name)'" -ErrorAction SilentlyContinue).StartMode
-        Write-Host "`n$($definition.Name) — $($definition.Description)" -ForegroundColor Yellow
-        Write-Host "Estado: $($service.Status) | Inicio: $startMode"
-        if (-not (Confirm-Action "¿Detener y deshabilitar $($definition.Name)?")) { $skipped++; continue }
-        try {
-            if ($service.Status -ne 'Stopped') { Stop-Service -Name $definition.Name -Force -ErrorAction Stop }
-            Set-Service -Name $definition.Name -StartupType Disabled -ErrorAction Stop
-            Write-Ok "$($definition.Name) deshabilitado. Se puede revertir desde services.msc."
-            $changed++
-        } catch { Write-Fail "$($definition.Name): $($_.Exception.Message)" }
-    }
-    Write-Ok "Resumen: $changed servicio(s) cambiado(s); $skipped omitido(s)."
-}
-
-function Split-PathVariable([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value)) { return @() }
-    return @($Value -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-}
-
-function Get-UniquePathEntries([string[]]$Entries) {
-    $seen = @{}; $result = @()
-    foreach ($entry in $Entries) {
-        $key = $entry.TrimEnd('\').ToLowerInvariant()
-        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $result += $entry }
-    }
-    return $result
-}
-
-function Backup-EnvironmentPath {
-    $backupDir = Join-Path $script:ToolRoot 'backups'
-    if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir | Out-Null }
-    $backupFile = Join-Path $backupDir ("PATH-backup-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-    @(
-        '# Clean Windows Toolkit - PATH backup',
-        "# Date: $(Get-Date -Format o)",
-        "USER=$([Environment]::GetEnvironmentVariable('Path','User'))",
-        "MACHINE=$([Environment]::GetEnvironmentVariable('Path','Machine'))"
-    ) | Set-Content -LiteralPath $backupFile -Encoding UTF8
-    return $backupFile
-}
-
-function Repair-SystemPath {
-    Write-Title 'Auditar y reparar PATH'
-    $scopes = @('User')
-    if ($script:IsAdmin) { $scopes += 'Machine' }
-    else { Write-Warn 'Sin privilegios elevados solo se reparará el PATH del usuario; el PATH del sistema se auditará sin modificar.' }
-
-    $plan = @(); $totalDuplicates = 0
-    foreach ($scope in @('User','Machine')) {
-        $raw = [Environment]::GetEnvironmentVariable('Path', $scope)
-        $entries = @(Split-PathVariable $raw)
-        $unique = @(Get-UniquePathEntries $entries)
-        $missing = @($unique | Where-Object { -not (Test-Path ([Environment]::ExpandEnvironmentVariables($_))) })
-        $duplicates = $entries.Count - $unique.Count
-        $totalDuplicates += $duplicates
-        Write-Host "`n$scope PATH: $($entries.Count) entradas; $duplicates duplicadas; $($missing.Count) no verificables." -ForegroundColor Cyan
-        $missing | ForEach-Object { Write-Host "  ? $_" -ForegroundColor DarkYellow }
-        $plan += [pscustomobject]@{ Scope=$scope; Raw=$raw; Entries=$unique; Duplicates=$duplicates }
-    }
-    Write-Warn 'Las rutas inexistentes/no verificables se conservarán por seguridad; solo se quitan vacíos y duplicados exactos.'
-    if ($totalDuplicates -eq 0) { Write-Ok 'Resumen: PATH ya está normalizado; no se hicieron cambios.'; return }
-    if (-not (Confirm-Action "¿Crear backup y quitar $totalDuplicates duplicado(s) de los ámbitos permitidos?")) {
-        Write-Info 'Acción cancelada.'; return
-    }
-    try {
-        $backup = Backup-EnvironmentPath; $changed = 0
-        foreach ($item in $plan | Where-Object { $_.Scope -in $scopes -and $_.Duplicates -gt 0 }) {
-            [Environment]::SetEnvironmentVariable('Path', ($item.Entries -join ';'), $item.Scope)
-            $changed++
+        if ($null -eq $service) {
+            Write-Host "$($definition.Name): no está instalado." -ForegroundColor DarkGray
+            continue
         }
-        $env:Path = @(
-            [Environment]::GetEnvironmentVariable('Path','Machine'),
-            [Environment]::GetEnvironmentVariable('Path','User')
-        ) -join ';'
-        Write-Ok "Resumen: $changed ámbito(s) reparado(s). Backup: $backup"
-    } catch { Write-Fail "No se pudo reparar PATH: $($_.Exception.Message)" }
+
+        $startMode = 'No disponible'
+        try {
+            $startMode = (Get-CimInstance Win32_Service -Filter "Name='$($definition.Name)'" -ErrorAction Stop).StartMode
+        } catch {
+            Write-Verbose "No se pudo consultar modo de inicio de $($definition.Name): $($_.Exception.Message)"
+        }
+
+        Write-Host ''
+        Write-Host "$($definition.Name) - $($definition.Description)" -ForegroundColor Yellow
+        Write-Host "Estado: $($service.Status) | Inicio: $startMode" -ForegroundColor Gray
+
+        if (-not (Confirm-CleanAction -Message "Detener y deshabilitar $($definition.Name)")) {
+            $skipped++
+            continue
+        }
+
+        if ($PSCmdlet.ShouldProcess($definition.Name, 'Detener y deshabilitar servicio')) {
+            try {
+                if ($service.Status -ne 'Stopped') {
+                    Stop-Service -Name $definition.Name -Force -ErrorAction Stop
+                }
+                Set-Service -Name $definition.Name -StartupType Disabled -ErrorAction Stop
+                Write-Host "$($definition.Name) deshabilitado." -ForegroundColor Green
+                $changed++
+            } catch {
+                Write-Warning "$($definition.Name): $($_.Exception.Message)"
+            }
+        }
+    }
+
+    Write-Host ("Resumen: {0} servicio(s) cambiados; {1} omitidos." -f $changed, $skipped) -ForegroundColor Green
 }
 
 function Get-PythonCommand {
+    <#
+    .SYNOPSIS
+        Detecta una instalación real de Python 3 evitando alias de WindowsApps.
+    #>
+    [CmdletBinding()]
+    param()
+
     $candidates = @()
     $python = Get-Command python.exe -ErrorAction SilentlyContinue
     if ($python) { $candidates += $python.Source }
     $python3 = Get-Command python3.exe -ErrorAction SilentlyContinue
     if ($python3) { $candidates += $python3.Source }
-    try { $candidates += (& py.exe -0p 2>$null | ForEach-Object { ($_ -replace '^\s*-V:\S+\s+','').Trim() }) } catch {}
-    $candidates = @($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and ($_ -notmatch '\\WindowsApps\\') } | Select-Object -Unique)
+
+    try {
+        $candidates += (& py.exe -0p 2>$null | ForEach-Object { ($_ -replace '^\s*-V:\S+\s+', '').Trim() })
+    } catch {
+        Write-Verbose "py.exe no disponible: $($_.Exception.Message)"
+    }
+
+    $candidates = @(
+        $candidates |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_) -and ($_ -notmatch '\\WindowsApps\\') } |
+            Select-Object -Unique
+    )
+
     foreach ($candidate in $candidates) {
         try {
             $version = (& $candidate --version 2>&1 | Select-Object -First 1)
             if ($LASTEXITCODE -eq 0 -and $version -match '^Python 3\.') {
-                return [pscustomobject]@{ Path=$candidate; Version=[string]$version }
+                return [pscustomobject]@{ Path = $candidate; Version = [string]$version }
             }
-        } catch {}
+        } catch {
+            Write-Verbose "Python candidato inválido '$candidate': $($_.Exception.Message)"
+        }
     }
+
     return $null
 }
 
 function Repair-PythonConfiguration {
-    Write-Title 'Reparar configuración de Python'
+    <#
+    .SYNOPSIS
+        Prioriza Python 3 real en PATH de usuario y verifica pip.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host ''
+    Write-Host '== Reparar Python ==' -ForegroundColor Cyan
     $python = Get-PythonCommand
-    if ($null -eq $python) { Write-Warn 'No se encontró una instalación real de Python 3. No se hicieron cambios.'; return }
+    if ($null -eq $python) {
+        Write-Host 'No se encontró una instalación real de Python 3.' -ForegroundColor Yellow
+        return
+    }
+
     $root = Split-Path -Parent $python.Path
     $scripts = Join-Path $root 'Scripts'
-    Write-Info "Detectado: $($python.Version) en $($python.Path)"
-    $entries = @(Split-PathVariable ([Environment]::GetEnvironmentVariable('Path','User')))
-    $newEntries = @(Get-UniquePathEntries (@($root, $scripts) + $entries))
-    if (-not (Confirm-Action '¿Crear backup, priorizar esta instalación en PATH de usuario y verificar pip?')) {
-        Write-Info 'Acción cancelada.'; return
+    Write-Host "Detectado: $($python.Version) en $($python.Path)" -ForegroundColor Gray
+
+    $entries = @(Split-PathVariable -Value ([Environment]::GetEnvironmentVariable('Path', 'User')))
+    $newEntries = @(Get-UniquePathEntry -Entry (@($root, $scripts) + $entries))
+
+    if (-not (Confirm-CleanAction -Message 'Crear backup, priorizar esta instalación en PATH de usuario y verificar pip')) {
+        Write-Host 'Acción cancelada.' -ForegroundColor Gray
+        return
     }
+
     try {
         $backup = Backup-EnvironmentPath
         [Environment]::SetEnvironmentVariable('Path', ($newEntries -join ';'), 'User')
         $env:Path = "$root;$scripts;$env:Path"
+
         & $python.Path -m ensurepip --upgrade
-        if ($LASTEXITCODE -ne 0) { throw "ensurepip terminó con código $LASTEXITCODE" }
+        if ($LASTEXITCODE -ne 0) {
+            throw "ensurepip terminó con código $LASTEXITCODE"
+        }
+
         $pipVersion = (& $python.Path -m pip --version 2>&1 | Select-Object -First 1)
-        Write-Ok "Resumen: Python priorizado y pip verificado ($pipVersion). Backup: $backup"
-        Write-Info 'Cerrá y reabrí la terminal para que otras sesiones usen el PATH actualizado.'
-    } catch { Write-Fail "No se pudo completar la reparación: $($_.Exception.Message)" }
+        Write-Host "Python priorizado y pip verificado: $pipVersion" -ForegroundColor Green
+        Write-Host "Backup: $backup" -ForegroundColor DarkGray
+    } catch {
+        Write-Warning "No se pudo completar la reparación de Python: $($_.Exception.Message)"
+    }
+}
+
+function Get-DiskInventory {
+    <#
+    .SYNOPSIS
+        Obtiene discos físicos y tipo de medio.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $items = @()
+
+    try {
+        $searcher = [System.Management.ManagementObjectSearcher]::new('SELECT Index, Model, MediaType, Size FROM Win32_DiskDrive')
+        foreach ($disk in @($searcher.Get())) {
+            $label = "{0} {1}" -f $disk.Model, $disk.MediaType
+            $media = if ($label -match 'SSD|NVMe|Solid State') { 'SSD' } elseif ($label -match 'HDD|Hard Disk|Fixed hard disk') { 'HDD' } else { 'Desconocido' }
+            $items += [pscustomobject]@{
+                Number = [string]$disk.Index
+                Model = [string]$disk.Model
+                MediaType = $media
+                Size = [double]$disk.Size
+            }
+        }
+    } catch {
+        Write-Warning "No se pudo consultar Win32_DiskDrive: $($_.Exception.Message)"
+    }
+
+    return $items
+}
+
+function Show-DiskInventory {
+    <#
+    .SYNOPSIS
+        Muestra inventario de discos SSD/HDD.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Operation '== Inventario de discos =='
+    $disks = @(Get-DiskInventory)
+    if ($disks.Count -eq 0) {
+        Write-Warning 'No se detectaron discos físicos.'
+        return
+    }
+
+    $disks |
+        Select-Object @{N='Disco';E={$_.Number}}, @{N='Modelo';E={$_.Model}}, @{N='Tipo';E={$_.MediaType}}, @{N='Tamaño';E={Format-ByteSize $_.Size}} |
+        Format-Table -AutoSize
+
+    if ($disks.MediaType -contains 'Desconocido') {
+        Write-Warning 'No se asumirá que un disco desconocido es HDD.'
+    }
+}
+
+function Get-DriveMediaType {
+    <#
+    .SYNOPSIS
+        Devuelve el tipo de medio de la unidad indicada.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]$')]
+        [string]$DriveLetter
+    )
+
+    $partition = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
+    $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction Stop
+    $physical = @(Get-DiskInventory | Where-Object { $_.Number -eq [string]$disk.Number }) | Select-Object -First 1
+    if ($null -eq $physical) {
+        return 'Desconocido'
+    }
+
+    return $physical.MediaType
+}
+
+function Invoke-HddDefrag {
+    <#
+    .SYNOPSIS
+        Ejecuta defrag.exe solo cuando la unidad se confirma como HDD.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [ValidatePattern('^[A-Za-z]$')]
+        [string]$DriveLetter = 'C'
+    )
+
+    Write-Operation '== Desfragmentación segura de HDD =='
+    if (-not (Assert-Administrator -Operation 'Desfragmentar disco')) {
+        return
+    }
+
+    $letter = $DriveLetter.ToUpperInvariant()
+    $media = Get-DriveMediaType -DriveLetter $letter
+    Write-Operation "Unidad $letter`: detectada como $media."
+
+    if ($media -eq 'SSD') {
+        Write-Warning 'Acción bloqueada: no se desfragmentan SSD desde esta herramienta.'
+        return
+    }
+
+    if ($media -ne 'HDD') {
+        Write-Warning 'Acción bloqueada: no se pudo confirmar que la unidad sea HDD.'
+        return
+    }
+
+    $defrag = Join-Path $env:WINDIR 'System32\defrag.exe'
+    if ($PSCmdlet.ShouldProcess("$letter`:", 'defrag.exe /U /V')) {
+        & $defrag "$letter`:" /U /V
+        if ($LASTEXITCODE -ne 0) {
+            throw "defrag.exe terminó con código $LASTEXITCODE."
+        }
+    }
+}
+
+function Split-PathVariable {
+    <#
+    .SYNOPSIS
+        Divide una variable PATH en entradas no vacías.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @()
+    }
+
+    return @($Value -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Get-UniquePathEntry {
+    <#
+    .SYNOPSIS
+        Quita duplicados exactos de PATH conservando orden.
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$Entry
+    )
+
+    $seen = @{}
+    $result = @()
+    foreach ($item in $Entry) {
+        $key = $item.TrimEnd('\').ToLowerInvariant()
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $result += $item
+        }
+    }
+
+    return $result
+}
+
+function Backup-EnvironmentPath {
+    <#
+    .SYNOPSIS
+        Crea backup del PATH de usuario y máquina.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $backupDir = Join-Path $script:ToolRoot 'backups'
+    if (-not (Test-Path -LiteralPath $backupDir)) {
+        [void](New-Item -ItemType Directory -Path $backupDir -Force)
+    }
+
+    $backupFile = Join-Path $backupDir ("PATH-backup-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    @(
+        '# Clean Windows - PATH backup'
+        "# Date: $(Get-Date -Format o)"
+        "USER=$([Environment]::GetEnvironmentVariable('Path', 'User'))"
+        "MACHINE=$([Environment]::GetEnvironmentVariable('Path', 'Machine'))"
+    ) | Set-Content -LiteralPath $backupFile -Encoding UTF8
+
+    return $backupFile
+}
+
+function Repair-EnvironmentPath {
+    <#
+    .SYNOPSIS
+        Normaliza PATH quitando vacíos y duplicados exactos; conserva rutas inexistentes.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    Write-Operation '== Reparación conservadora de PATH =='
+    $allowedScopes = @('User')
+    if (Test-Administrator) {
+        $allowedScopes += 'Machine'
+    } else {
+        Write-Warning 'Sin elevación solo se modificará PATH de usuario; PATH de máquina se auditará.'
+    }
+
+    $plan = @()
+    $duplicateCount = 0
+
+    foreach ($scope in @('User', 'Machine')) {
+        $raw = [Environment]::GetEnvironmentVariable('Path', $scope)
+        $entries = @(Split-PathVariable -Value $raw)
+        $unique = @(Get-UniquePathEntry -Entry $entries)
+        $duplicates = $entries.Count - $unique.Count
+        $missing = @($unique | Where-Object { -not (Test-Path -LiteralPath ([Environment]::ExpandEnvironmentVariables($_))) })
+        $duplicateCount += $duplicates
+
+        Write-Operation ("{0} PATH: {1} entradas, {2} duplicadas, {3} no verificables." -f $scope, $entries.Count, $duplicates, $missing.Count)
+        $missing | ForEach-Object { Write-Verbose "Ruta no verificable conservada: $_" }
+
+        $plan += [pscustomobject]@{
+            Scope = $scope
+            Entries = $unique
+            Duplicates = $duplicates
+        }
+    }
+
+    if ($duplicateCount -eq 0) {
+        Write-Operation 'PATH ya está normalizado.'
+        return
+    }
+
+    if (-not (Confirm-CleanAction -Message "Crear backup y quitar $duplicateCount duplicado(s) de los ámbitos permitidos")) {
+        Write-Operation 'Reparación de PATH cancelada.'
+        return
+    }
+
+    $backup = Backup-EnvironmentPath
+    foreach ($item in $plan | Where-Object { $_.Scope -in $allowedScopes -and $_.Duplicates -gt 0 }) {
+        if ($PSCmdlet.ShouldProcess("$($item.Scope) PATH", 'Quitar entradas duplicadas exactas')) {
+            [Environment]::SetEnvironmentVariable('Path', ($item.Entries -join ';'), $item.Scope)
+        }
+    }
+
+    $env:Path = @(
+        [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        [Environment]::GetEnvironmentVariable('Path', 'User')
+    ) -join ';'
+
+    Write-Operation "Backup creado: $backup"
 }
 
 function Get-SystemSnapshot {
+    <#
+    .SYNOPSIS
+        Obtiene información básica del sistema.
+    #>
+    [CmdletBinding()]
+    param()
+
     $windows = [Environment]::OSVersion.VersionString
     $architecture = $env:PROCESSOR_ARCHITECTURE
     $cpuName = $env:PROCESSOR_IDENTIFIER
-    $ramTotal = 'No disponible'; $ramFree = 'No disponible'; $driveFree = 'No disponible'
+    $ramTotal = 'No disponible'
+    $diskType = 'Desconocido'
 
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-        $windows = "$($os.Caption) (build $($os.BuildNumber))"
+        $windows = "$($os.Caption) build $($os.BuildNumber)"
         $architecture = $os.OSArchitecture
-        $ramFree = Format-Bytes ($os.FreePhysicalMemory * 1KB)
-    } catch {}
+    } catch {
+        Write-Verbose "No se pudo consultar Win32_OperatingSystem: $($_.Exception.Message)"
+    }
+
     try {
         $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
-        if ($cpu.Name) { $cpuName = $cpu.Name }
+        if ($cpu.Name) {
+            $cpuName = $cpu.Name
+        }
     } catch {
-        try { $cpuName = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction Stop).ProcessorNameString.Trim() } catch {}
+        try {
+            $cpuName = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction Stop).ProcessorNameString.Trim()
+        } catch {
+            Write-Verbose "No se pudo consultar CPU: $($_.Exception.Message)"
+        }
     }
+
     try {
         $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
-        $ramTotal = Format-Bytes $computer.TotalPhysicalMemory
-    } catch {}
-    try {
-        $drive = New-Object System.IO.DriveInfo($env:SystemDrive)
-        if ($drive.IsReady) { $driveFree = Format-Bytes $drive.AvailableFreeSpace }
-    } catch {}
+        $ramTotal = Format-ByteSize ([double]$computer.TotalPhysicalMemory)
+    } catch {
+        Write-Verbose "No se pudo consultar RAM: $($_.Exception.Message)"
+    }
 
-    return [pscustomobject][ordered]@{
-        Equipo = $env:COMPUTERNAME
-        Usuario = $env:USERNAME
-        Windows = $windows
-        Arquitectura = $architecture
+    try {
+        $firstDisk = @(Get-DiskInventory | Where-Object { $_.MediaType -in @('SSD', 'HDD') } | Select-Object -First 1)
+        if ($firstDisk.Count -gt 0) {
+            $diskType = $firstDisk[0].MediaType
+        }
+    } catch {
+        Write-Verbose "No se pudo consultar tipo de disco: $($_.Exception.Message)"
+    }
+
+    [pscustomobject][ordered]@{
+        OS = $windows
         CPU = $cpuName
-        'RAM total' = $ramTotal
-        'RAM libre' = $ramFree
-        PowerShell = $PSVersionTable.PSVersion.ToString()
-        Administrador = if ($script:IsAdmin) { 'Sí' } else { 'No' }
-        'Unidad del sistema libre' = $driveFree
+        RAM = $ramTotal
+        'Tipo de Disco' = $diskType
+        Usuario = $env:USERNAME
+        Arquitectura = $architecture
+        FechaHora = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Administrador = if (Test-Administrator) { 'Sí' } else { 'No' }
     }
 }
 
-function Show-SystemInformation {
-    Write-Title 'Información detallada del sistema'
-    Get-SystemSnapshot | Format-List
-    Write-Ok 'Resumen: información del sistema actualizada.'
+function Limit-Text {
+    <#
+    .SYNOPSIS
+        Recorta texto para mantener la alineación de la TUI.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Text,
+
+        [Parameter(Mandatory)]
+        [int]$Width
+    )
+
+    if ($null -eq $Text) {
+        $Text = ''
+    }
+
+    if ($Width -le 3) {
+        return $Text.Substring(0, [Math]::Min($Text.Length, $Width))
+    }
+
+    if ($Text.Length -le $Width) {
+        return $Text
+    }
+
+    return ($Text.Substring(0, $Width - 3) + '...')
 }
 
-function Invoke-SafeWhisper {
-    Write-Title 'Ejecutar safe_whisper.py'
-    $scriptPath = Join-Path $script:ToolRoot 'safe_whisper.py'
-    if (-not (Test-Path -LiteralPath $scriptPath)) { Write-Warn "No existe $scriptPath."; return }
-    $python = Get-PythonCommand
-    if ($null -eq $python) { Write-Warn 'Python 3 no está disponible. No se ejecutó safe_whisper.py.'; return }
-    if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) { Write-Warn 'FFmpeg no está disponible en PATH; safe_whisper.py lo necesita.'; return }
-    & $python.Path -c 'import whisper' 2>$null
-    if ($LASTEXITCODE -ne 0) { Write-Warn "El paquete Python 'whisper' no está instalado en $($python.Path)."; return }
+function New-PanelLine {
+    <#
+    .SYNOPSIS
+        Construye una línea de panel de ancho fijo.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Text,
 
-    $inputFile = (Read-Host 'Ruta del audio o video').Trim('"')
-    if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) { Write-Warn 'El archivo de entrada no existe.'; return }
-    $language = Read-Host 'Idioma [es]'; if (-not $language) { $language = 'es' }
-    $model = Read-Host 'Modelo [small]'; if (-not $model) { $model = 'small' }
-    $chunk = Read-Host 'Duración de fragmento en segundos [600]'; if (-not $chunk) { $chunk = '600' }
-    $chunkValue = 0
-    if (-not [int]::TryParse($chunk, [ref]$chunkValue) -or $chunkValue -lt 30) { Write-Warn 'La duración debe ser un entero de al menos 30 segundos.'; return }
-    $outDir = Read-Host 'Carpeta de salida [transcripts]'; if (-not $outDir) { $outDir = (Join-Path $script:ToolRoot 'transcripts') }
-    if (-not (Confirm-Action "¿Iniciar transcripción con el modelo '$model'?")) { Write-Info 'Acción cancelada.'; return }
-    try {
-        & $python.Path $scriptPath --input $inputFile --lang $language --model $model --chunk_sec $chunkValue --outdir $outDir
-        if ($LASTEXITCODE -eq 0) { Write-Ok "Resumen: safe_whisper.py finalizó correctamente. Salida: $outDir" }
-        else { Write-Fail "safe_whisper.py terminó con código $LASTEXITCODE." }
-    } catch { Write-Fail "No se pudo ejecutar safe_whisper.py: $($_.Exception.Message)" }
+        [Parameter(Mandatory)]
+        [int]$Width
+    )
+
+    $innerWidth = $Width - 4
+    $content = Limit-Text -Text $Text -Width $innerWidth
+    return '| ' + $content.PadRight($innerWidth) + ' |'
 }
 
-function Get-ConsoleWidth {
-    try { return [int]$Host.UI.RawUI.WindowSize.Width } catch { return 80 }
-}
+function New-PanelRule {
+    <#
+    .SYNOPSIS
+        Construye borde superior, inferior o título de panel.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [int]$Width,
 
-function Limit-Text([string]$Text, [int]$Width) {
-    if ($null -eq $Text) { $Text = '' }
-    if ($Width -le 3) { return $Text.Substring(0, [Math]::Min($Text.Length, $Width)) }
-    if ($Text.Length -le $Width) { return $Text }
-    return $Text.Substring(0, $Width - 3) + '...'
-}
+        [string]$Title
+    )
 
-function Format-SystemField([string]$Label, [object]$Value, [int]$Width) {
-    $prefix = ('{0,-14}: ' -f (Limit-Text $Label 14))
-    $valueWidth = [Math]::Max(1, $Width - $prefix.Length)
-    return $prefix + (Limit-Text ([string]$Value) $valueWidth).PadRight($valueWidth)
-}
-
-function Write-PanelRule([int]$Width, [string]$Caption) {
     $inner = $Width - 2
-    if ([string]::IsNullOrWhiteSpace($Caption)) {
-        Write-Host ('+' + ('-' * $inner) + '+') -ForegroundColor DarkGray
-        return
+    if ([string]::IsNullOrWhiteSpace($Title)) {
+        return '+' + ('-' * $inner) + '+'
     }
-    $captionText = " $Caption "
-    if ($captionText.Length -gt $inner) { $captionText = Limit-Text $captionText $inner }
-    $remaining = $inner - $captionText.Length
+
+    $caption = " $Title "
+    if ($caption.Length -gt $inner) {
+        $caption = Limit-Text -Text $caption -Width $inner
+    }
+
+    $remaining = $inner - $caption.Length
     $left = [Math]::Floor($remaining / 2)
     $right = $remaining - $left
-    Write-Host ('+' + ('-' * $left) + $captionText + ('-' * $right) + '+') -ForegroundColor DarkGray
+    return '+' + ('-' * $left) + $caption + ('-' * $right) + '+'
 }
 
-function Write-SystemPanel([object]$Snapshot, [int]$Width) {
-    Write-PanelRule $Width 'INFORMACIÓN DEL SISTEMA'
-    if ($Width -ge 88) {
-        $gap = 3
-        $availableWidth = $Width - 4 - $gap
-        $leftWidth = [Math]::Floor($availableWidth / 2)
-        $rightWidth = $availableWidth - $leftWidth
-        $rows = @(
-            @('Equipo', $Snapshot.Equipo, 'Usuario', $Snapshot.Usuario),
-            @('Windows', $Snapshot.Windows, 'Arquitectura', $Snapshot.Arquitectura),
-            @('CPU', $Snapshot.CPU, 'PowerShell', $Snapshot.PowerShell),
-            @('RAM total', $Snapshot.'RAM total', 'RAM libre', $Snapshot.'RAM libre'),
-            @('Administrador', $Snapshot.Administrador, 'Unidad libre', $Snapshot.'Unidad del sistema libre')
-        )
-        foreach ($row in $rows) {
-            $left = Format-SystemField $row[0] $row[1] $leftWidth
-            $right = Format-SystemField $row[2] $row[3] $rightWidth
-            Write-Host ('| ' + $left + (' ' * $gap) + $right + ' |') -ForegroundColor Gray
-        }
-    } else {
-        $fieldWidth = $Width - 4
-        foreach ($property in $Snapshot.PSObject.Properties) {
-            $label = if ($property.Name -eq 'Unidad del sistema libre') { 'Unidad libre' } else { $property.Name }
-            $line = Format-SystemField $label $property.Value $fieldWidth
-            Write-Host ('| ' + $line + ' |') -ForegroundColor Gray
-        }
-    }
-    Write-PanelRule $Width ''
-}
+function Write-TuiRow {
+    <#
+    .SYNOPSIS
+        Escribe una fila compuesta por panel izquierdo y derecho.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Left,
 
-function Write-MenuLine([string]$Text, [int]$Width, [ConsoleColor]$Color = [ConsoleColor]::Cyan) {
-    $line = Limit-Text $Text ($Width - 4)
-    Write-Host ('  ' + $line) -ForegroundColor $Color
+        [Parameter(Mandatory)]
+        [string]$Right,
+
+        [ConsoleColor]$LeftColor = [ConsoleColor]::Cyan,
+        [ConsoleColor]$RightColor = [ConsoleColor]::Gray
+    )
+
+    Write-Host '  ' -NoNewline
+    Write-Host $Left -ForegroundColor $LeftColor -NoNewline
+    Write-Host '  ' -NoNewline
+    Write-Host $Right -ForegroundColor $RightColor
 }
 
 function Show-Menu {
-    Clear-Host
-    $consoleWidth = Get-ConsoleWidth
-    $panelWidth = [Math]::Min(104, [Math]::Max(32, $consoleWidth - 2))
-    $snapshot = Get-SystemSnapshot
+    <#
+    .SYNOPSIS
+        Muestra la interfaz visual interactiva por consola.
+    #>
+    [CmdletBinding()]
+    param()
 
-    Write-Host ''
-    Write-Host '  CLEAN WINDOWS' -ForegroundColor Green
-    Write-Host (Limit-Text '  Toolkit de mantenimiento seguro para Windows' $panelWidth) -ForegroundColor Gray
-    Write-Host ''
-    Write-SystemPanel $snapshot $panelWidth
-    Write-Host ''
+$running = $true
+    while ($running) {
+        Clear-Host
+        $snapshot = Get-SystemSnapshot
+        $leftWidth = 42
+        $rightWidth = 68
 
-    if ($script:IsAdmin) {
-        Write-MenuLine '[OK] Sesión con privilegios de Administrador.' $panelWidth Green
-    } else {
-        if ($panelWidth -lt 72) {
-            Write-MenuLine '[AVISO] 4 y 5 requieren Administrador.' $panelWidth Yellow
-            Write-MenuLine '        1 y 6 tendrán alcance limitado.' $panelWidth Yellow
-        } else {
-            Write-MenuLine '[AVISO] 4 y 5 requieren Administrador; 1 y 6 tendrán alcance limitado.' $panelWidth Yellow
+        $banner = @'
+   ______ _      ______          _   _   __          ___           _
+  / _____| |    |  ____|   /\   | \ | |  \ \        / (_)         | |
+ | |     | |    | |__     /  \  |  \| |   \ \  /\  / / _ _ __   __| | _____      _____
+ | |     | |    |  __|   / /\ \ | . ` |    \ \/  \/ / | | '_ \ / _` |/ _ \ \ /\ / / __|
+ | |____ | |____| |____ / ____ \| |\  |     \  /\  /  | | | | | (_| | (_) \ V  V /\__ \
+  \_____|______|______/_/    \_\_| \_|      \/  \/   |_|_| |_|\__,_|\___/ \_/\_/ |___/
+'@
+
+        Write-Host ''
+        Write-Host $banner -ForegroundColor White -BackgroundColor Black
+        Write-Host ''
+        Write-Host '  CLEAN WINDOWS' -ForegroundColor Cyan
+        Write-Host ''
+
+        $leftPanel = @(
+            New-PanelRule -Width $leftWidth -Title 'MENÚ PRINCIPAL'
+            New-PanelLine -Width $leftWidth -Text '[1] Limpieza de Temporales'
+            New-PanelLine -Width $leftWidth -Text '[2] Liberar Memoria'
+            New-PanelLine -Width $leftWidth -Text '[3] Detectar Disco'
+            New-PanelLine -Width $leftWidth -Text '[4] Desfragmentar HDD'
+            New-PanelLine -Width $leftWidth -Text '[5] Desactivar Servicios'
+            New-PanelLine -Width $leftWidth -Text '[6] Reparar PATH'
+            New-PanelLine -Width $leftWidth -Text '[7] Reparar Python'
+            New-PanelLine -Width $leftWidth -Text '[8] Mostrar Info del Sistema'
+            New-PanelLine -Width $leftWidth -Text '[0] Salir'
+            New-PanelRule -Width $leftWidth
+        )
+
+        $rightPanel = @(
+            New-PanelRule -Width $rightWidth -Title 'INFORMACIÓN DEL SISTEMA'
+            New-PanelLine -Width $rightWidth -Text "OS: $($snapshot.OS)"
+            New-PanelLine -Width $rightWidth -Text "CPU: $($snapshot.CPU)"
+            New-PanelLine -Width $rightWidth -Text "RAM: $($snapshot.RAM)"
+            New-PanelLine -Width $rightWidth -Text "Tipo de Disco: $($snapshot.'Tipo de Disco')"
+            New-PanelLine -Width $rightWidth -Text "Usuario actual: $($snapshot.Usuario)"
+            New-PanelLine -Width $rightWidth -Text "Fecha/Hora: $($snapshot.FechaHora)"
+            New-PanelLine -Width $rightWidth -Text "Administrador: $($snapshot.Administrador)"
+            New-PanelRule -Width $rightWidth
+            New-PanelRule -Width $rightWidth -Title 'ADVERTENCIA'
+            New-PanelLine -Width $rightWidth -Text 'Ejecuta como Administrador para limpieza completa.'
+            New-PanelLine -Width $rightWidth -Text 'DISM, servicios, Windows Temp y defrag requieren elevación.'
+            New-PanelRule -Width $rightWidth
+        )
+
+        $rowCount = [Math]::Max($leftPanel.Count, $rightPanel.Count)
+        for ($i = 0; $i -lt $rowCount; $i++) {
+            $left = if ($i -lt $leftPanel.Count) { $leftPanel[$i] } else { ' ' * $leftWidth }
+            $right = if ($i -lt $rightPanel.Count) { $rightPanel[$i] } else { ' ' * $rightWidth }
+            $rightColor = if ($i -ge 8) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Gray }
+            Write-TuiRow -Left $left -Right $right -LeftColor Cyan -RightColor $rightColor
+        }
+
+        Write-Host ''
+        Write-Host '  Selecciona una opcion: ' -ForegroundColor Green -NoNewline
+        $choice = Read-Host
+        if ([string]::IsNullOrWhiteSpace($choice) -and [Console]::IsInputRedirected) {
+            $running = $false
+            continue
+        }
+
+        try {
+            switch ($choice) {
+                '1' {
+                    Invoke-TemporaryFileCleanup -OlderThanDays $OlderThanDays -WhatIf:$WhatIfPreference
+                    Invoke-Windows11CacheCleanup -OlderThanDays $OlderThanDays -WhatIf:$WhatIfPreference
+                    Invoke-DeliveryOptimizationCleanup -WhatIf:$WhatIfPreference
+                    Invoke-RecycleBinCleanup -WhatIf:$WhatIfPreference
+                }
+                '2' { Invoke-BrowserMemoryCleanup -WhatIf:$WhatIfPreference }
+                '3' { Show-DiskInventory }
+                '4' { Invoke-HddDefrag -DriveLetter $DriveLetter -WhatIf:$WhatIfPreference }
+                '5' { Disable-OptionalService -WhatIf:$WhatIfPreference }
+                '6' { Repair-EnvironmentPath -WhatIf:$WhatIfPreference }
+                '7' { Repair-PythonConfiguration }
+                '8' { Get-SystemSnapshot | Format-List }
+                '0' { $running = $false }
+                default { Write-Warning 'Opción inválida.' }
+            }
+        } catch {
+            Write-Error "Error en la tarea: $($_.Exception.Message)"
+        }
+
+        if ($running) {
+            [void](Read-Host 'Presiona Enter para continuar')
         }
     }
-    Write-Host ''
-
-    Write-MenuLine 'MANTENIMIENTO' $panelWidth Green
-    Write-MenuLine '[1] Limpiar archivos temporales' $panelWidth
-    Write-MenuLine '[2] Liberar memoria cerrando navegadores' $panelWidth
-    Write-MenuLine '[3] Detectar tipo de disco SSD/HDD' $panelWidth
-    Write-MenuLine '[4] Desfragmentar disco (solo HDD)' $panelWidth
-    Write-Host ''
-    Write-MenuLine 'REPARACIÓN' $panelWidth Green
-    Write-MenuLine '[6] Reparar PATH del sistema' $panelWidth
-    Write-MenuLine '[7] Reparar configuración de Python' $panelWidth
-    Write-Host ''
-    Write-MenuLine 'HERRAMIENTAS' $panelWidth Green
-    Write-MenuLine '[5] Revisar servicios opcionales' $panelWidth
-    Write-MenuLine '[8] Mostrar información detallada del sistema' $panelWidth
-    Write-MenuLine '[9] Ejecutar safe_whisper.py' $panelWidth
-    Write-MenuLine '[0] Salir' $panelWidth DarkGray
-    Write-Host ''
 }
 
-$script:IsAdmin = Test-Administrator
-$running = $true
-while ($running) {
-    Show-Menu
-    $choice = Read-Host 'Seleccioná una opción'
-    try {
-        switch ($choice) {
-            '1' { Invoke-TemporaryCleanup }
-            '2' { Invoke-BrowserCleanup }
-            '3' { Show-DiskType }
-            '4' { Invoke-HddDefrag }
-            '5' { Invoke-ServiceReview }
-            '6' { Repair-SystemPath }
-            '7' { Repair-PythonConfiguration }
-            '8' { Show-SystemInformation }
-            '9' { Invoke-SafeWhisper }
-            '0' { $running = $false; Write-Host "`nHasta la próxima." -ForegroundColor Green }
-            default { Write-Warn 'Opción inválida.' }
+function Invoke-WindowsClean {
+    <#
+    .SYNOPSIS
+        Orquesta tareas de mantenimiento seguro para Windows 11.
+
+    .DESCRIPTION
+        Ejecuta una o más tareas de limpieza y mantenimiento. Las tareas de sistema
+        validan elevación antes de ejecutarse y las limpiezas manuales evitan puntos
+        de reanálisis, archivos recientes y archivos bloqueados.
+
+    .PARAMETER Task
+        Lista de tareas a ejecutar.
+
+    .PARAMETER OlderThanDays
+        Antigüedad mínima para limpiezas manuales.
+
+    .PARAMETER DriveLetter
+        Unidad a evaluar para DefragHdd.
+
+    .PARAMETER Force
+        Omite confirmaciones interactivas.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param(
+        [ValidateSet(
+            'All',
+            'TemporaryFiles',
+            'Win11Caches',
+            'DeliveryOptimization',
+            'WindowsComponents',
+            'RecycleBin',
+            'DiskInfo',
+            'DefragHdd',
+            'Path',
+            'Memory',
+            'Services',
+            'Python'
+        )]
+        [string[]]$Task = @('All'),
+
+        [ValidateRange(0, 3650)]
+        [int]$OlderThanDays = 1,
+
+        [ValidatePattern('^[A-Za-z]$')]
+        [string]$DriveLetter = 'C',
+
+        [switch]$Force
+    )
+
+    $expandedTask = if ($Task -contains 'All') {
+        @('TemporaryFiles', 'Win11Caches', 'DeliveryOptimization', 'WindowsComponents', 'RecycleBin', 'DiskInfo')
+    } else {
+        $Task
+    }
+
+    if (-not $Force -and -not (Confirm-CleanAction -Message "Ejecutar tareas: $($expandedTask -join ', ')")) {
+        Write-Operation 'Ejecución cancelada.'
+        return
+    }
+
+    foreach ($item in $expandedTask) {
+        try {
+            switch ($item) {
+                'TemporaryFiles' { Invoke-TemporaryFileCleanup -OlderThanDays $OlderThanDays -WhatIf:$WhatIfPreference }
+                'Win11Caches' { Invoke-Windows11CacheCleanup -OlderThanDays $OlderThanDays -WhatIf:$WhatIfPreference }
+                'DeliveryOptimization' { Invoke-DeliveryOptimizationCleanup -WhatIf:$WhatIfPreference }
+                'WindowsComponents' { Invoke-WindowsComponentCleanup -WhatIf:$WhatIfPreference }
+                'RecycleBin' { Invoke-RecycleBinCleanup -WhatIf:$WhatIfPreference }
+                'DiskInfo' { Show-DiskInventory }
+                'DefragHdd' { Invoke-HddDefrag -DriveLetter $DriveLetter -WhatIf:$WhatIfPreference }
+                'Path' { Repair-EnvironmentPath -WhatIf:$WhatIfPreference }
+                'Memory' { Invoke-BrowserMemoryCleanup -WhatIf:$WhatIfPreference }
+                'Services' { Disable-OptionalService -WhatIf:$WhatIfPreference }
+                'Python' { Repair-PythonConfiguration }
+            }
+        } catch {
+            Write-Error "La tarea '$item' falló: $($_.Exception.Message)"
         }
-    } catch { Write-Fail "Error no esperado: $($_.Exception.Message)" }
-    if ($running) { Pause-Toolkit }
+    }
+}
+
+if ($Menu) {
+    Request-AdministratorRelaunch
+    Show-Menu
+} elseif ($Task -and $Task.Count -gt 0) {
+    Invoke-WindowsClean -Task $Task -OlderThanDays $OlderThanDays -DriveLetter $DriveLetter -Force:$Force -WhatIf:$WhatIfPreference
+} else {
+    Request-AdministratorRelaunch
+    Show-Menu
 }
